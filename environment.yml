@@ -1,0 +1,19 @@
+name: BEELINE
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - r=4.2
+  - pip
+  - rpy2>=3.5
+  - matplotlib>=3.7
+  - pandas>=1.5
+  - networkx>=2.8
+  - seaborn>=0.12
+  - tqdm>=4.64
+  - numpy>=1.23
+  - scikit-learn>=1.2
+  - PyYAML>=6.0
+  - pip:
+    - mygene==3.2.2
