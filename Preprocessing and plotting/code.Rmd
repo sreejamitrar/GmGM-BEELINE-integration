@@ -1,0 +1,829 @@
+# === Load required libraries ===
+packages <- c("slingshot", "gam", "biomaRt", "pheatmap", "dplyr", "readr")
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+invisible(lapply(packages, install_if_missing))
+
+library(slingshot)
+library(gam)
+library(biomaRt)
+library(pheatmap)
+library(dplyr)
+library(readr)
+library(patchwork)
+
+citation("gam")
+
+setwd("D:/C-Drive Here/Documents/R work/dissertation")
+
+# === Loading expression matrices ===
+expr_0h <- read.table("GSE214264_RAW/GSM6602328_scRNA_seq_ES.tsv.gz", 
+                      header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+expr_24h <- read.table("GSE214264_RAW/GSM6602329_scRNA_seq_24h.tsv.gz", 
+                       header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+expr_48h <- read.table("GSE214264_RAW/GSM6602330_scRNA_seq_48h.tsv.gz", 
+                       header = TRUE, sep = "\t", row.names = 1, check.names = FALSE)
+str(expr_0h)
+range(expr_0h)
+mean(expr_0h == 0)
+mean(expr_0h > 1000)
+has_decimals <- any(expr_0h %% 1 != 0)
+print(has_decimals)
+# === Cleaning Ensembl IDs ===
+rownames(expr_0h) <- gsub("\\..*", "", rownames(expr_0h))
+rownames(expr_24h) <- gsub("\\..*", "", rownames(expr_24h))
+rownames(expr_48h) <- gsub("\\..*", "", rownames(expr_48h))
+
+# === Renaming columns by timepoint ===
+colnames(expr_0h) <- paste0("0h_", colnames(expr_0h))
+colnames(expr_24h) <- paste0("24h_", colnames(expr_24h))
+colnames(expr_48h) <- paste0("48h_", colnames(expr_48h))
+
+# === Merging datasets ===
+common_genes <- Reduce(intersect, list(rownames(expr_0h), 
+                                       rownames(expr_24h), rownames(expr_48h)))
+expr_merged <- cbind(expr_0h[common_genes, ], 
+                     expr_24h[common_genes, ], 
+                     expr_48h[common_genes, ])
+dim(expr_merged)
+
+# === Log-normalizing the merged matrix ===
+expr_log <- log2(expr_merged + 1)
+
+# === Creating metadata ===
+cell_meta <- data.frame(Cell = colnames(expr_log), 
+                        Time = sub("_.*", "", colnames(expr_log)))
+rownames(cell_meta) <- cell_meta$Cell
+head(cell_meta,2)
+
+# === PCA and clustering ===
+pca <- prcomp(t(expr_log), scale. = FALSE)
+rd <- as.data.frame(pca$x[, 1:3])
+head(rd)
+rownames(rd) <- colnames(expr_log)
+set.seed(123)
+km <- kmeans(rd, centers = 3)
+cell_meta$Cluster <- as.factor(km$cluster)
+head(cell_meta)
+str(cell_meta)
+time_numeric <- as.numeric(gsub("h", "", cell_meta$Time))
+start_cluster <- names(which.min(tapply(time_numeric, cell_meta$Cluster, mean)))
+
+# === Slingshot pseudotime ===
+slingshot_res <- slingshot(as.matrix(rd), clusterLabels = cell_meta$Cluster, start.clus = start_cluster)
+ss_pt_df <- as.data.frame(slingPseudotime(slingshot_res))
+t <- ss_pt_df[, 1]
+plot(slingshot_res)
+
+# === Filtering out lowly expressed genes (10% rule) ===
+expressed_genes <- rownames(expr_log)[rowMeans(expr_log > 0) >= 0.1]
+Y <- expr_log[expressed_genes, ]
+round(sum(Y == 0) / prod(dim(Y)), 3) #37.5% of the expression matrix has 0s which is typical
+zero_var_genes <- apply(Y, 1, var) == 0
+sum(zero_var_genes) #no genes with zero variance are in the expression matrix
+h1<-hist(as.numeric(as.matrix(Y)), breaks=100, main="Log-Transformed Expression Distribution", xlab="Log-transformed expression (log2(Y+1))")
+gene_dropout <- rowMeans(Y == 0)
+sum(gene_dropout) #5556.154
+h2<-hist(gene_dropout, breaks=50, main="Gene Dropout (Fraction Zeros)", xlab="Fraction of Cells with Zero Expression")
+sum(Y == 0) / length(Y)  # % of zero values in the matrix
+
+
+
+# === Mapping Ensembl to MGI ===
+mart <- useEnsembl(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+gene_mapping <- getBM(attributes = c("ensembl_gene_id", "mgi_symbol"), filters = "ensembl_gene_id", values = rownames(Y), mart = mart)
+gene_mapping <- gene_mapping[gene_mapping$mgi_symbol != "", ]
+gene_mapping <- gene_mapping[!duplicated(gene_mapping$ensembl_gene_id), ]
+gene_mapping <- gene_mapping[!duplicated(gene_mapping$mgi_symbol), ]
+mapped_ids <- intersect(rownames(Y), gene_mapping$ensembl_gene_id)
+Y <- Y[mapped_ids, ]
+rownames(Y) <- gene_mapping$mgi_symbol[match(rownames(Y), gene_mapping$ensembl_gene_id)]
+dim(Y)
+
+# === Loading TRRUST and intersecting with Expression Data ===
+trrust <- read_tsv("trrust_rawdata.mouse.tsv", col_names = FALSE)
+sum(trrust$Effect=="Unknown")
+colnames(trrust) <- c("TF", "Target_gene", "Effect", "PMID")
+beeline_trrust <- trrust %>%
+  mutate(Type = ifelse(Effect == "Activation", "+", "-")) %>%
+  select(Gene1 = TF, Gene2 = Target_gene, Type)
+dim(beeline_trrust)
+ref_genes <- union(beeline_trrust$Gene1, beeline_trrust$Gene2)
+overlap_genes <- intersect(rownames(Y), ref_genes)
+Y_overlap <- Y[overlap_genes, ] #dont do this!
+dim(Y_overlap)
+
+BEELINE_TRRUST_ACTUALGTN<-beeline_trrust[overlap_genes,]
+dim(BEELINE_TRRUST_ACTUALGTN)
+
+# === GAM + Bonferroni Correction ===
+gam.pval <- apply(Y_overlap, 1, function(z) {
+  d <- data.frame(z = z, t = t)
+  suppressWarnings({ tmp <- gam(z ~ lo(t), data = d) })
+  summary(tmp)[4][[1]][1, 5]
+})
+gam.padj <- p.adjust(gam.pval, method = "bonferroni")
+
+
+#PREPARING BEELINE INPUTS
+# === selecting top 1000 genes selected by GAM for GRN inference ===
+top500_genes <- names(sort(gam.padj))[1:500]
+Y_top500 <- Y_overlap[top500_genes, ]
+head(rownames(Y_top500,1))
+Y_top500 <- Y_top500[complete.cases(Y_top500), ]
+anyNA(Y_top500)
+dim(Y_top500)
+#write.csv(Y_top500, 
+          #"NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/INPUTS/ExpressionData.csv")
+
+#are there zero variance genes?
+# gene_var <- apply(Y_top500, 1, var)
+# #Y_top500 <- Y_top500[gene_var > 0, ]
+# summary(gene_var)
+# sum(gene_var < 10)  #genes with extremely low variance
+# cell_var <- apply(Y_top500, 2, var)
+# summary(cell_var)
+# sum(cell_var < 11)
+
+#=== filter ground truth network for these 500 genes ===
+filtered_network_500 <- beeline_trrust %>%
+  filter(Gene1 %in% rownames(Y_top500) & Gene2 %in% rownames(Y_top500))
+head(filtered_network_500)
+#write.csv(filtered_network_500, 
+          #"NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/INPUTS/refNetwork.csv")
+dim(filtered_network_500)
+#this set is purely on variance and bonferroni correction
+
+# #checking zeros and variances in data
+# heatmap(log1p(as.matrix(heatdata)), 
+#         Colv = NA,
+#         scale = "row",  # normalize each gene
+#         col = colorRampPalette(c("yellow", "orange", "darkblue"))(100),
+#         labRow = FALSE,
+#         labCol = FALSE,
+#         main = "Top 250 Dynamically Expressed Genes (GAM Bonferroni)")
+
+
+# === TF-biased top 500 significant TFs: TFs with p-adj < 0.01 ===
+tfs <- unique(beeline_trrust$Gene1)
+length(tfs)
+sorted_genes <- names(sort(gam.padj)) 
+filtered_tfs <- intersect(tfs, sorted_genes) #tfs in gam as well as in trrust
+signif_tfs <- filtered_tfs[gam.padj[filtered_tfs] < 0.01]
+length(signif_tfs)
+# available_forced_tfs <- setdiff(signif_tfs, sorted_genes[1:500])
+# n_forced <- min(length(available_forced_tfs), 100)
+# n_forced
+#n_forced is 0 for threshold p.adj < 1 meaning all significant tfs are already in sorted_genes[1:500] or included in Y_top500
+#SO TF BIASED SET IS DISCARDED
+#top significant genes p.adj<0.01
+top_tfs <- head(signif_tfs,15)
+top_tfs
+top_genes <- names(sort(gam.padj))[1:15]
+
+top_tfs2 <- head(signif_tfs,110) #for barplot
+top_genes2 <- names(sort(gam.padj))[1:500]
+
+length(intersect(top_genes2, filtered_network_500$Gene2))
+
+# === Save pseudotime file ===
+#beeline_pseudotime <- data.frame(Cell = rownames(ss_pt_df), PseudoTime1 = ss_pt_df[,1], PseudoTime2 = NA)
+#write.csv(beeline_pseudotime, "NEW BEELINE INPUTS AND RESULTS/TOP500 TF BIASED/INPUTS/Pseudotime.csv", row.names = FALSE)
+
+# === visualization & exploration ===
+
+# PCA visualization
+library(ggplot2)
+library(patchwork)
+rd$Pseudotime <- t
+rd$Cluster <- cell_meta$Cluster
+
+p1 <- ggplot(rd, aes(x = PC1, y = PC2, color = Pseudotime)) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "PCA Coloured by Pseudotime")
+
+p2 <- ggplot(rd, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  theme_minimal() +
+  labs(title = "PCA Coloured by Cluster")
+
+p1 + p2
+
+#RAW VALUES NO SCALING WITHIN GGPLOT 
+library(reshape2)
+library(ggplot2)
+library(patchwork)  # for p1 + p2
+
+# === Pseudotime-Associated Genes ===
+heat_data <- Y_top500[top_genes, ]
+heat_data_tf <- Y_top500[top_tfs, ]
+
+df1 <- melt(as.matrix(heat_data))
+colnames(df1) <- c("Gene", "Cell", "Expression")
+df1$Timepoint <- cell_meta[df1$Cell, "Time"]
+df1$Gene <- factor(df1$Gene, levels = rev(top_genes))  # preserve gene order
+mid_val <- median(df1$Expression, na.rm = TRUE)
+# === TF-Associated Genes ===
+df2 <- melt(as.matrix(heat_data_tf))
+colnames(df2) <- c("Gene", "Cell", "Expression")
+df2$Timepoint <- cell_meta[df2$Cell, "Time"]
+df2$Gene <- factor(df2$Gene, levels = rev(top_tfs))  # preserve gene order
+mid_val2 <- median(df2$Expression, na.rm = TRUE)
+# Heatmap 1: Pseudotime-Associated Genes
+p1 <- ggplot(df1, aes(x = Cell, y = Gene, fill = Expression)) +
+  geom_tile() +
+  facet_grid(~Timepoint, scales = "free_x", space = "free_x") +
+  scale_fill_gradient2(low = "lightsalmon", mid = "beige", high = "seagreen2", midpoint = mid_val) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = NA),
+        panel.spacing = unit(0.1, "lines")) +
+  labs(title = "Top 15 Pseudotime-Associated Genes", x = NULL, y = NULL)
+
+# Heatmap 2: Top TF Genes
+p2 <- ggplot(df2, aes(x = Cell, y = Gene, fill = Expression)) +
+  geom_tile() +
+  facet_grid(~Timepoint, scales = "free_x", space = "free_x") +
+  scale_fill_gradient2(low = "lightsalmon", mid = "beige", high = "seagreen2", midpoint = mid_val2) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = NA),
+        panel.spacing = unit(0.1, "lines")) +
+  labs(title = "Top 15 Pseudotime-Associated TFs", x = NULL, y = NULL)
+
+# Plot side-by-side
+p1 + p2 + plot_layout(ncol = 2)
+
+
+#500 pseudotime associated genes
+# === Pseudotime-Associated Genes ===
+heat_data2 <- Y_top500[top_genes2, ]
+heat_data_tf2 <- Y_top500[top_tfs2, ]
+
+gene_dist <- dist(heat_data2)  # distance between genes
+gene_clust <- hclust(gene_dist)
+gene_order <- rownames(heat_data2)[gene_clust$order]
+cell_dist <- dist(t(heat_data2))  # transpose to cluster cells
+cell_clust <- hclust(cell_dist)
+cell_order <- colnames(heat_data2)[cell_clust$order]
+
+df500 <- melt(as.matrix(heat_data2))
+colnames(df500) <- c("Gene", "Cell", "Expression")
+df500$Timepoint <- cell_meta[df500$Cell, "Time"]
+df500$Gene <- factor(df500$Gene, levels = rev(gene_order))  # hierarchial clustering
+mid_val <- median(df500$Expression, na.rm = TRUE)
+# === TF-Associated Genes ===
+df5002 <- melt(as.matrix(heat_data_tf2))
+colnames(df5002) <- c("Gene", "Cell", "Expression")
+df5002$Timepoint <- cell_meta[df5002$Cell, "Time"]
+df5002$Gene <- factor(df5002$Gene, levels = rev(gene_order))  # hierarchial clustering
+mid_val2 <- median(df5002$Expression, na.rm = TRUE)
+# Heatmap 1: Pseudotime-Associated Genes
+p1 <- ggplot(df500, aes(x = Cell, y = Gene, fill = Expression)) +
+  geom_tile() +
+  facet_grid(~Timepoint, scales = "free_x", space = "free_x") +
+  scale_fill_gradient2(low = "lightsalmon", mid = "beige", high = "seagreen2", midpoint = mid_val) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = NA),
+        panel.spacing = unit(0.1, "lines")) +
+  labs(title = "Top 500 Pseudotime-Associated Genes", x = NULL, y = NULL)
+p1
+
+
+#BARPLOT OF EDGES COVERED BY ALGORITHMS
+# === Load Libraries ===
+library(stringr)
+
+# === file paths ===
+input_dir <- "NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/"
+files <- list(
+  GMGM = paste0(input_dir, "outFile_gmgm.txt"),
+  GRNBoost2 = paste0(input_dir, "outFile_grnboost2.txt"),
+  GENIE3 = paste0(input_dir, "outFile_genie3.txt")
+)
+
+top_tfs2 <- head(signif_tfs,110) #for barplot
+top_genes2 <- names(sort(gam.padj))[1:1000]
+
+# === predicted edges for each algorithm ===
+edges_gmgm <- read.table(files$GMGM, header = TRUE, stringsAsFactors = FALSE)
+colnames(edges_gmgm)[1:2] <- c("TF", "target")
+
+edges_grnboost2 <- read.table(files$GRNBoost2, header = TRUE, stringsAsFactors = FALSE)
+colnames(edges_grnboost2)[1:2] <- c("TF", "target")
+
+edges_genie3 <- read.table(files$GENIE3, header = TRUE, stringsAsFactors = FALSE)
+colnames(edges_genie3)[1:2] <- c("TF", "target")
+
+# === reference network ===
+refnetwork <- read.csv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/refNetwork.csv", header = TRUE, stringsAsFactors = FALSE)
+refnetwork$Gene1 <- as.character(refnetwork$Gene1)
+refnetwork$Gene2 <- as.character(refnetwork$Gene2)
+colnames(refnetwork)[2:3] <- c("TF", "target")  # Gene1 = TF, Gene2 = target
+str(refnetwork)
+
+# === top 500 predictions for each ===
+top_n <- 500
+top_gmgm <- head(arrange(edges_gmgm, desc(importance)), top_n)
+top_grnboost2 <- head(arrange(edges_grnboost2, desc(importance)), top_n)
+top_genie3 <- head(arrange(edges_genie3, desc(importance)), top_n)
+
+#summary table
+summary_df <- data.frame(
+  Algorithm = c("GMGM", "GRNBoost2", "GENIE3"),
+  
+  TFs_covered = c(
+    length(intersect(top_tfs2, unique(top_gmgm$TF))),
+    length(intersect(top_tfs2, unique(top_grnboost2$TF))),
+    length(intersect(top_tfs2, unique(top_genie3$TF)))
+  ),
+  
+  Genes_covered = c(
+    length(intersect(top_genes2, unique(top_gmgm$target))),
+    length(intersect(top_genes2, unique(top_grnboost2$target))),
+    length(intersect(top_genes2, unique(top_genie3$target)))
+  )
+)
+
+print(summary_df)
+
+#barplots tfs and genes covered by algorithms
+df_tfs <- summary_df %>%
+  select(Algorithm, TFs_covered) %>%
+  rename(Count = TFs_covered)
+df_genes <- summary_df %>%
+  select(Algorithm, Genes_covered) %>%
+  rename(Count = Genes_covered)
+# === Barplot for TFs covered ===
+p_tfs <- ggplot(df_tfs, aes(x = Algorithm, y = Count, fill = Algorithm)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "seagreen2") +
+  labs(title = "Top TFs Recovered by Algorithms",
+       y = "Number of Top TFs Recovered",
+       x = "Algorithm") +
+  theme_minimal() +
+  theme(legend.position = "none")
+# === Barplot for Genes covered ===
+p_genes <- ggplot(df_genes, aes(x = Algorithm, y = Count, fill = Algorithm)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsalmon") +
+  labs(title = "Top Genes Recovered by Algorithms",
+       y = "Number of Top Genes Recovered",
+       x = "Algorithm") +
+  theme_minimal() +
+  theme(legend.position = "none")
+p_tfs + p_genes
+
+#which edges individually
+
+filtered_gmgm <- top_gmgm %>%
+  filter(TF %in% top_tfs2 & target %in% top_genes2)
+filtered_grnboost2 <- top_grnboost2 %>%
+  filter(TF %in% top_tfs2 & target %in% top_genes2)
+filtered_genie3 <- top_genie3 %>%
+  filter(TF %in% top_tfs2 & target %in% top_genes2)
+
+refnetwork <- refnetwork %>%
+  mutate(
+    found_by_gmgm = paste(TF, target) %in% paste(filtered_gmgm$TF, filtered_gmgm$target),
+    found_by_grnboost2 = paste(TF, target) %in% paste(filtered_grnboost2$TF, filtered_grnboost2$target),
+    found_by_genie3 = paste(TF, target) %in% paste(filtered_genie3$TF, filtered_genie3$target)
+  )
+
+#edges detected by at least one algorithm
+refnetwork_detected <- refnetwork %>%
+  filter(found_by_gmgm | found_by_grnboost2 | found_by_genie3)
+
+print(refnetwork_detected)
+#filtering reference edges found by each
+found_edges_gmgm <- refnetwork %>% filter(found_by_gmgm == TRUE)
+found_edges_grnboost2 <- refnetwork %>% filter(found_by_grnboost2 == TRUE)
+found_edges_genie3 <- refnetwork %>% filter(found_by_genie3 == TRUE)
+#true positives
+n_positives_gmgm <- nrow(found_edges_gmgm)
+n_positives_grnboost2 <- nrow(found_edges_grnboost2)
+n_positives_genie3 <- nrow(found_edges_genie3)
+
+
+print(found_edges_gmgm) #TF
+print(found_edges_grnboost2)
+print(found_edges_genie3)
+
+#saving table
+refnetwork_detected<-refnetwork_detected[,-1]
+colnames(refnetwork_detected) <- c("TF", "Target", "Type", 
+                                   "GMGM", "GRNBoost2", "GENIE3")
+refnetwork_detected
+library(knitr)
+library(kableExtra)
+
+kable(refnetwork_detected, caption = "Reference Edges Detected by At Least One Algorithm") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  save_kable("refnetwork_detected_1000.html")
+
+
+cat("Number of edges found by GMGM:", nrow(found_edges_gmgm), "\n")
+cat("Number of edges found by GRNBoost2:", nrow(found_edges_grnboost2), "\n")
+cat("Number of edges found by GENIE3:", nrow(found_edges_genie3), "\n")
+
+# === summary of matched edges ===
+matched_counts <- data.frame(
+  Algorithm = c("GMGM", "GRNBoost2", "GENIE3"),
+  Matched_Edges = c(
+    nrow(found_edges_gmgm),
+    nrow(found_edges_grnboost2),
+    nrow(found_edges_genie3)
+  )
+)
+
+# === barplot ===
+ggplot(matched_counts, aes(x = Algorithm, y = Matched_Edges)) +
+  geom_bar(stat = "identity", fill = "mediumturquoise") +  # orange color
+  labs(title = "True Edges Recovered by Each Algorithm (1000 genes set)",
+       y = "Number of true edges",
+       x = "Algorithm") +
+  theme_minimal()
+
+#vertex distributions
+library(patchwork)
+# === out-degrees (TFs) or network density ===
+#GMGM
+tf_deg_gmgm <- table(top_gmgm$TF)
+df_deg_gmgm <- as.data.frame(tf_deg_gmgm)
+colnames(df_deg_gmgm) <- c("TF", "Degree")
+#GRNBoost2
+tf_deg_grnboost2 <- table(top_grnboost2$TF)
+df_deg_grnboost2 <- as.data.frame(tf_deg_grnboost2)
+colnames(df_deg_grnboost2) <- c("TF", "Degree")
+#GENIE3
+tf_deg_genie3 <- table(top_genie3$TF)
+df_deg_genie3 <- as.data.frame(tf_deg_genie3)
+colnames(df_deg_genie3) <- c("TF", "Degree")
+
+# === combined boxplot and summary ===
+df_deg_combined <- rbind(
+  data.frame(Algorithm = "GMGM", Degree = df_deg_gmgm$Degree),
+  data.frame(Algorithm = "GRNBoost2", Degree = df_deg_grnboost2$Degree),
+  data.frame(Algorithm = "GENIE3", Degree = df_deg_genie3$Degree)
+)
+# === histograms ===
+p1 <- ggplot(df_deg_gmgm, aes(x = Degree)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +
+  labs(title = "GMGM: TF Out-degree", x = "Targets per TF", y = "Count of TFs") +
+  theme_minimal()
+
+p2 <- ggplot(df_deg_grnboost2, aes(x = Degree)) +
+  geom_histogram(binwidth = 1, fill = "darkorange", color = "black") +
+  labs(title = "GRNBoost2: TF Out-degree", x = "Targets per TF", y = "Count of TFs") +
+  theme_minimal()
+
+p3 <- ggplot(df_deg_genie3, aes(x = Degree)) +
+  geom_histogram(binwidth = 1, fill = "darkgreen", color = "black") +
+  labs(title = "GENIE3: TF Out-degree", x = "Targets per TF", y = "Count of TFs") +
+  theme_minimal()
+
+p1 + p2 + p3
+
+# === boxplotss ===
+ggplot(df_deg_combined, aes(x = Algorithm, y = Degree, fill = Algorithm)) +
+  geom_boxplot() +
+  labs(title = "TF Out-degree Distribution Across Algorithms",
+       x = "Algorithm", y = "Targets per TF") +
+  theme_minimal()
+
+# === summary stats ===
+summary_stats <- df_deg_combined %>%
+  group_by(Algorithm) %>%
+  summarise(
+    Min = min(Degree),
+    Max = max(Degree),
+    Mean = round(mean(Degree), 2),
+    Median = median(Degree),
+    Num_TFs = n()
+  )
+
+print(summary_stats)
+
+
+
+
+#AUPRC AND AUROC curves
+#loading ground truth as a data frame
+gt <- read.csv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/refNetwork.csv", stringsAsFactors = FALSE)
+head(gt)
+gt <- gt %>%
+  select(Gene1, Gene2) %>%
+  distinct()
+head(gt) #unique pairs of regulators only
+
+gm <- read.table("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/outFile_gmgm.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+g3 <- read.table("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/outFile_genie3.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+gb2 <- read.table("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/outFile_grnboost2.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+#loading predictions
+dim(gb2)
+
+#install.packages("PRROC") #also used in BEELINE
+
+library(dplyr)
+library(pROC)
+library(PRROC)
+
+#ground truth cleaning and adding column Edge as identifier of interaction between A and B written as A_B
+gt <- gt %>%
+  mutate(Gene1 = toupper(trimws(Gene1)),
+         Gene2 = toupper(trimws(Gene2)),
+         Edge = paste(Gene1, Gene2, sep = "_")) %>%
+  select(Edge) %>%
+  distinct() %>%
+  mutate(Label = 1) #this is added as an identifier of positive edges
+
+#same cleaning and merging new Edge column and also adding algorithm names to the importance column
+gm <- gm %>%
+  mutate(TF = toupper(trimws(TF)),
+         target = toupper(trimws(target)),
+         Edge = paste(TF, target, sep = "_"),
+         GM_importance = importance) %>%
+  select(Edge, GM_importance)
+g3 <- g3 %>%
+  mutate(TF = toupper(trimws(TF)),
+         target = toupper(trimws(target)),
+         Edge = paste(TF, target, sep = "_"),
+         GENIE3_importance = importance) %>%
+  select(Edge, GENIE3_importance)
+gb2 <- gb2 %>%
+  mutate(TF = toupper(trimws(TF)),
+         target = toupper(trimws(target)),
+         Edge = paste(TF, target, sep = "_"),
+         GRNBOOST2_importance = importance) %>%
+  select(Edge, GRNBOOST2_importance)
+
+#all predicted edges from all algorithms true positives
+all_edges <- bind_rows(gm, g3, gb2) %>% distinct(Edge)
+# 
+# #negative set or negative edges that were not in the ground truth but have been predicted by algorithms- false positives
+neg_edges <- setdiff(all_edges$Edge, gt$Edge)
+neg_df <- data.frame(Edge = neg_edges, Label = 0) #label is 0 as it does not belong in ground truth
+
+pos_df <- gt
+neg_df <- neg_df
+
+# # joining scores for positives and negatives
+# pos_scores <- gt %>%
+#   left_join(gm, by = "Edge") %>% #this is why Edge needs to be unique
+#   left_join(g3, by = "Edge") %>%
+#   left_join(gb2, by = "Edge")
+# gt
+# pos_scores
+# neg_scores <- neg_df %>%
+#   left_join(gm, by = "Edge") %>%
+#   left_join(g3, by = "Edge") %>%
+#   left_join(gb2, by = "Edge")
+# all_scores <- bind_rows(pos_scores, neg_scores)
+# sum(!is.na(all_scores$GM_importance))
+# #combining positives and negatives and filtering out NAs
+# all_scores <- bind_rows(pos_scores, neg_scores) %>%
+#   filter(!is.na(GM_importance) & !is.na(GENIE3_importance) & !is.na(GRNBOOST2_importance))
+ #is filtering out na.GM_importance correct? GM_importance doesn't calculate edge weights for many edges as it outputs a sparse network while the other two are tree based and assign each Edge a value
+
+#GENIE3
+#this binds edges inferred by each algorithm to the true positives and false positives separately and more importantly filters NAs separately for each algorithm 
+genie3_scores <- bind_rows(pos_df, neg_df) %>% #this is true positives, false positives for the edges ONLY GENIE3 inferred
+  left_join(g3, by = "Edge") %>% #other algorithms retain the edges GmGM inferred NA for as GmGM creates a much more sparse network than them
+  filter(!is.na(GENIE3_importance))
+#GMGM
+gmgm_scores <- bind_rows(pos_df, neg_df) %>%
+  left_join(gm, by = "Edge") %>%
+  filter(!is.na(GM_importance))
+#GRNBOOST2
+grnboost2_scores <- bind_rows(pos_df, neg_df) %>%
+  left_join(gb2, by = "Edge") %>%
+  filter(!is.na(GRNBOOST2_importance))
+
+roc_g3 <- roc(genie3_scores$Label, genie3_scores$GENIE3_importance, quiet = TRUE) #thus roc is calculated without being restrained to the genes GmGM inferred
+roc_gm <- roc(gmgm_scores$Label, gmgm_scores$GM_importance, quiet = TRUE)
+roc_gb2 <- roc(grnboost2_scores$Label, grnboost2_scores$GRNBOOST2_importance, quiet = TRUE)
+
+#ROC plot
+
+plot(roc_g3, col = "blue", main = "ROC Curves for Top 1000 Genes Associated with Pseudotime", legacy.axes = TRUE)
+lines(roc_gm, col = "green")
+lines(roc_gb2, col = "red")
+
+legend(x = 0.6, y = 0.2, inset = c(0, 0),
+       legend = c(
+         paste0("GENIE3 (AUC = ", round(auc(roc_g3), 3), ")"),
+         paste0("GMGM (AUC = ", round(auc(roc_gm), 3), ")"),
+         paste0("GRNBOOST2 (AUC = ", round(auc(roc_gb2), 3), ")")
+       ),
+       col = c("blue", "green", "red"), lty = 1)
+
+#PR CURVES
+pr_g3 <- pr.curve(
+  scores.class0 = genie3_scores$GENIE3_importance[genie3_scores$Label == 1],
+  scores.class1 = genie3_scores$GENIE3_importance[genie3_scores$Label == 0],
+  curve = TRUE
+)
+pr_gm <- pr.curve(
+  scores.class0 = gmgm_scores$GM_importance[gmgm_scores$Label == 1],
+  scores.class1 = gmgm_scores$GM_importance[gmgm_scores$Label == 0],
+  curve = TRUE
+)
+pr_gb2 <- pr.curve(
+  scores.class0 = grnboost2_scores$GRNBOOST2_importance[grnboost2_scores$Label == 1],
+  scores.class1 = grnboost2_scores$GRNBOOST2_importance[grnboost2_scores$Label == 0],
+  curve = TRUE
+)
+
+plot(pr_g3, col = "blue", main = "Precision-Recall Curves for Top 500 Predictions", ylim = c(0, 0.02),
+     auc.main=FALSE)
+lines(pr_gm$curve[, 1], pr_gm$curve[, 2], col = "green")
+lines(pr_gb2$curve[, 1], pr_gb2$curve[, 2], col = "red")
+legend("topright",
+       legend = c(
+         paste0("GENIE3 (AUPR = ", round(pr_g3$auc.integral, 3), ")"),
+         paste0("GMGM (AUPR = ", round(pr_gm$auc.integral, 3), ")"),
+         paste0("GRNBOOST2 (AUPR = ", round(pr_gb2$auc.integral, 3), ")")
+       ),
+       col = c("blue", "green", "red"), lty = 1)
+
+#Edgeweight heatmap
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+
+# --- Load GMGM and Normalize ---
+gm <- read_tsv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/outFile_gmgm.txt")
+gm$TF <- toupper(trimws(gm$TF))
+gm$target <- toupper(trimws(gm$target))
+gm$Edge <- paste(gm$TF, gm$target, sep = "_")
+gm <- gm %>%
+  group_by(Edge) %>%
+  summarise(GMGM = mean(importance)) %>%
+  ungroup()
+gm_min <- min(gm$GMGM)
+gm_max <- max(gm$GMGM)
+gm$GMGM <- (gm$GMGM - gm_min) / (gm_max - gm_min)
+
+# --- Load GENIE3 and Normalize ---
+g3 <- read_tsv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/outFile_genie3.txt")
+g3$TF <- toupper(trimws(g3$TF))
+g3$target <- toupper(trimws(g3$target))
+g3$Edge <- paste(g3$TF, g3$target, sep = "_")
+g3 <- g3 %>%
+  group_by(Edge) %>%
+  summarise(GENIE3 = mean(importance)) %>%
+  ungroup()
+g3_min <- min(g3$GENIE3)
+g3_max <- max(g3$GENIE3)
+g3$GENIE3 <- (g3$GENIE3 - g3_min) / (g3_max - g3_min)
+
+# --- Load GRNBOOST2 and Normalize ---
+gb2 <- read_tsv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/outFile_grnboost2.txt")
+gb2$TF <- toupper(trimws(gb2$TF))
+gb2$target <- toupper(trimws(gb2$target))
+gb2$Edge <- paste(gb2$TF, gb2$target, sep = "_")
+gb2 <- gb2 %>%
+  group_by(Edge) %>%
+  summarise(GRNBOOST2 = mean(importance)) %>%
+  ungroup()
+gb2_min <- min(gb2$GRNBOOST2)
+gb2_max <- max(gb2$GRNBOOST2)
+gb2$GRNBOOST2 <- (gb2$GRNBOOST2 - gb2_min) / (gb2_max - gb2_min)
+
+# --- Load Ground Truth ---
+gt <- read_csv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/refNetwork.csv")
+gt$Gene1 <- toupper(trimws(gt$Gene1))
+gt$Gene2 <- toupper(trimws(gt$Gene2))
+gt$Edge <- paste(gt$Gene1, gt$Gene2, sep = "_")
+gt <- gt %>%
+  select(Edge) %>%
+  mutate(`Ground Truth` = 1)
+
+# --- Merge all data ---
+heatmap_wide <- full_join(gm, g3, by = "Edge") %>%
+  full_join(gb2, by = "Edge") %>%
+  full_join(gt, by = "Edge") %>%
+  mutate(
+    GMGM = ifelse(is.na(GMGM), 0, GMGM),
+    GENIE3 = ifelse(is.na(GENIE3), 0, GENIE3),
+    GRNBOOST2 = ifelse(is.na(GRNBOOST2), 0, GRNBOOST2),
+    `Ground Truth` = ifelse(is.na(`Ground Truth`), 0, `Ground Truth`)
+  )
+
+# Filter to only edges in Ground Truth (all ~566 edges)
+heatmap_gt_edges <- heatmap_wide %>%
+  filter(`Ground Truth` == 1)
+
+# Remove Ground Truth column before pivoting (exclude GT row in heatmap)
+heatmap_long_gt <- heatmap_gt_edges %>%
+  select(Edge, GMGM, GENIE3, GRNBOOST2) %>%
+  pivot_longer(cols = c("GMGM", "GENIE3", "GRNBOOST2"),
+               names_to = "Method", values_to = "Importance")
+
+# Plot without x-axis labels
+ggplot(heatmap_long_gt, aes(x = Edge, y = Method, fill = Importance)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(colors = c("yellow", "orange", "red", "purple", "darkblue"), name="Importance") +
+  theme_minimal(base_size = 10) +
+  labs(
+    title = "Edge Importance Heatmap for Ground Truth Edges",
+    x = "TF–Target Edge", y = "Method"
+  ) +
+  theme(
+    axis.text.x = element_blank(),  # hide x-axis labels to avoid clutter
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size = 10)
+  )
+
+
+
+
+
+
+
+#EPR barplot
+# === Plot barplot ===
+epr<-read.csv("NEW BEELINE INPUTS AND RESULTS/TOP500 UNBIASED/GSD-EPr.csv")
+colnames(epr)<- c("Algorithm","EPR")
+epr
+epr$Type <- c("Evaluated", "Evaluated", "Evaluated")
+newrow<-data.frame(Algorithm="SCODE", EPR=1.4, Type="Reference")
+epr<-rbind(epr, newrow)
+newrow<-data.frame(Algorithm="SINCERITIES", EPR=2.3, Type="Reference")
+epr<-rbind(epr, newrow)
+
+ggplot(epr, aes(x = Algorithm, y = EPR, fill=Type)) +
+  geom_bar(stat = "identity") + 
+  geom_text(aes(label = round(EPR, 2)), 
+            vjust = 8, color = "black", size = 6) + 
+  labs(title = "Early precision ratio (EPR) for top 500 genes",
+       y = "Early Precision Ratio (EPR)",
+       x = "Algorithm") +
+  ylim(0,2.5) +
+  scale_fill_manual(values = c("Evaluated" = "palegreen3", "Reference" = "lightgrey")) +
+  theme_minimal()
+
+#AUPRC barplot
+# === Plot barplot ===
+auprc<-read.csv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/GSD-AUPRC.csv")
+colnames(auprc)<- c("Algorithm","AUPRC")
+auprc
+#calculate auprc ratios first
+n_predicted<-top_n 
+#gmgm
+auprc_random_gmgm <- n_positives_gmgm / n_predicted
+auprc_ratio_gmgm <- 0.002 / auprc_random_gmgm
+auprc_ratio_gmgm
+#genie3
+auprc_random_genie3 <- n_positives_genie3 / n_predicted
+auprc_ratio_genie3 <- 0.002 / auprc_random_genie3
+auprc_ratio_genie3
+#grnboost2
+auprc_random_grnboost2 <- n_positives_grnboost2 / n_predicted
+auprc_ratio_grnboost2 <- 0.002 / auprc_random_grnboost2
+auprc_ratio_grnboost2
+
+auprc
+auprc$Type <- c("Evaluated", "Evaluated", "Evaluated")
+auprc$AUPRC<-c(auprc_ratio_gmgm, auprc_ratio_genie3, auprc_ratio_grnboost2)
+newrow<-data.frame(Algorithm="SINCERITIES", AUPRC=1.1, Type="Reference")
+auprc<-rbind(auprc, newrow)
+newrow<-data.frame(Algorithm="GENIE3", AUPRC=1.6, Type="Reference")
+auprc<-rbind(auprc, newrow)
+
+ggplot(auprc, aes(x = Algorithm, y = AUPRC, fill=Type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) + 
+  geom_text(aes(label = round(AUPRC, 3)), 
+            position = position_dodge(width = 0.8),
+            vjust = 2, color = "black", size = 4) + 
+  labs(title = "AUPRC for top 1000 genes",
+       y = "AUPRC",
+       x = "Algorithm") +
+  ylim(0,6) +
+  scale_fill_manual(values = c("Evaluated" = "palegreen3", "Reference" = "lightgrey")) +
+  theme_minimal()
+auprc
+
+#AUROC barplot
+# === Plot barplot ===
+auroc<-read.csv("NEW BEELINE INPUTS AND RESULTS/TOP1000 UNBIASED/GSD-AUROC.csv")
+colnames(auroc)<- c("Algorithm","AUROC")
+auroc
+auroc$Type <- c("Evaluated", "Evaluated", "Evaluated")
+
+ggplot(auroc, aes(x = Algorithm, y = AUROC, fill=Type)) +
+  geom_bar(stat = "identity") + 
+  geom_text(aes(label = round(AUROC, 4)), 
+            vjust = 8, color = "black", size = 6) + 
+  labs(title = "AUROC for top 1000 genes",
+       y = "AUROC",
+       x = "Algorithm") +
+  ylim(0,0.8) +
+  scale_fill_manual(values = c("Evaluated" = "palegreen3", "Reference" = "lightgrey")) +
+  theme_minimal()
