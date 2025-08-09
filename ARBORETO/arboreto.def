@@ -1,0 +1,30 @@
+Bootstrap: docker
+From: continuumio/miniconda3:latest
+Stage: spython-base
+
+%files
+/users/mgcc4941/myproject/Beeline/Algorithms/ARBORETO/environment.yml /tmp/environment.yml
+/users/mgcc4941/myproject/Beeline/Algorithms/ARBORETO/runArboreto.py /
+%post
+
+apt-get update && apt-get install -y time
+
+conda env create -f /tmp/environment.yml
+
+
+mkdir -p /data
+cd /data
+mkdir /data
+
+PATH=/opt/conda/envs/BEELINE/bin:$PATH
+
+
+
+%environment
+export PATH=/opt/conda/envs/BEELINE/bin:$PATH
+%runscript
+cd /data
+exec /bin/bash conda run --no-capture-output -n BEELINE python /runArboreto.py "$@"
+%startscript
+cd /data
+exec /bin/bash conda run --no-capture-output -n BEELINE python /runArboreto.py "$@"
