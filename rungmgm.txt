@@ -1,0 +1,159 @@
+import pandas as pd
+import time
+import numpy as np
+from scipy import sparse
+from GmGM.GmGM import GmGM
+from GmGM.dataset import Dataset
+#importing necessary libraries
+
+start = time.time()
+print("Starting GmGM inference job...")
+
+print("Reading expression data...")
+data = pd.read_csv("ExpressionData.csv", index_col=0)
+print(f"Data shape: {data.shape}")
+
+
+#treating data as one modality called "rna"
+dataset_dict = {
+    "rna": data.values  #dataframe needs to be converted to numpy array
+}
+
+#structure is a tuple of axes describing the dimensions of dataset
+#with "genes" is the first axis which is rows and "cells" second which are columns
+structure_dict = {
+    "rna": ("genes", "cells")
+}
+
+dataset = Dataset(dataset=dataset_dict, structure=structure_dict)
+print("Dataset wrapped and ready.")
+#dataset object required by GmGM is ready
+
+
+#MAIN
+print("Running GmGM inference..")
+try:
+    result = GmGM(
+        dataset,
+        to_keep={"genes": 5, "cells": 3},
+        min_edges={"genes": 0, "cells": 0},
+        threshold_method="rowwise-col-weighted"
+    )
+    print("GmGM inference successful")
+except Exception as e:
+    print("GmGM failed with error", str(e))
+    with open("gmgm_ERROR.log", "w") as f:
+        f.write(str(e))
+    raise SystemExit("Stopping due to GmGM failure.")
+    
+if not hasattr(result, "precision_matrices") or not result.precision_matrices:
+    print("Result object is missing precision matrices. Exiting.")
+    raise SystemExit("Result object incomplete.")
+#running GmGM algorithm with Bailey's suggested inputs
+
+
+print("Attempting to access and save adjacency matrix")
+print("Available precision matrices keys:", result.precision_matrices.keys())
+
+
+try:
+    for axis in result.precision_matrices:
+        matrix = result.precision_matrices[axis]
+        print(f"Saving precision matrix for axis: {axis}, shape: {matrix.shape}")
+
+        #using sparse-aware dataframe constructor
+        if axis == 'genes':
+            if matrix.shape[0] == matrix.shape[1]:  #square matrix
+                adj_df = pd.DataFrame.sparse.from_spmatrix(matrix, index=data.index, columns=data.index)
+            else:
+                adj_df = pd.DataFrame.sparse.from_spmatrix(matrix, index=data.index, columns=['value'])
+            adj_df.to_csv("gmgm_precision_matrix_genes.csv")
+            print("Saved gene precision matrix as CSV:gmgm_precision_matrix_genes.csv")
+           
+            #saving as compressed sparse matrix
+            sparse.save_npz("precision_genes.npz", matrix)
+            print("Saved gene precision matrix as sparse: precision_genes.npz")
+
+            #saving gene names
+            with open("gene_names.txt", "w") as f:
+                for name in data.index:
+                    f.write(f"{name}\n")
+            print("Saved gene names to gene_names.txt")
+
+        elif axis == 'cells':
+            if matrix.shape[0] == matrix.shape[1]:  #square matrix
+                adj_df = pd.DataFrame.sparse.from_spmatrix(matrix, index=data.columns, columns=data.columns)
+            else:
+                adj_df = pd.DataFrame.sparse.from_spmatrix(matrix, index=data.columns, columns=['value'])
+            adj_df.to_csv("gmgm_precision_matrix_cells.csv")
+
+except Exception as e:
+    print("Failed to extract or save precision matrix:", str(e))
+    print("Result object attributes:", dir(result))
+
+
+
+end = time.time()
+print(f"Total runtime: {end - start:.2f} seconds")
+
+#load sparse matrix and gene names
+print("Loading sparse matrix and gene names...")
+matrix = sparse.load_npz("precision_genes.npz")
+
+with open("gene_names.txt", "r") as f:
+    genes = [line.strip() for line in f]
+
+#convert to COO format for efficient row/col access
+print("Converting matrix to COO format...")
+coo = matrix.tocoo()
+
+#prepare edge list
+print("Generating edge list from sparse matrix...")
+df_edges = pd.DataFrame({
+    'Gene1': [genes[i] for i in coo.row],
+    'Gene2': [genes[j] for j in coo.col],
+    'EdgeWeight': coo.data  # absolute weights bypassed otherwise np.abs(coo.data)
+})
+
+#removing self-loops
+print("Removing self-loops...")
+df_edges = df_edges[df_edges['Gene1'] != df_edges['Gene2']]
+
+#dropping symmetric duplicates (undirected edge)
+print("Dropping symmetric duplicates...")
+df_edges['sorted_pair'] = df_edges.apply(
+    lambda row: tuple(sorted([row['Gene1'], row['Gene2']])), axis=1
+)
+df_edges = df_edges.drop_duplicates(subset='sorted_pair').drop(columns='sorted_pair')
+
+#sorting by descending edge weight
+print("Sorting edges by descending weight...")
+df_edges = df_edges.sort_values(by='EdgeWeight', ascending=False)
+
+#save outFile.txt with columns: TF, target, importance (tab-separated)
+df_out = df_edges.rename(columns={
+    'Gene1': 'TF',
+    'Gene2': 'target',
+    'EdgeWeight': 'importance'
+})
+df_out.to_csv("outFile.txt", sep="\t", index=False)
+print("Saved raw edge list to 'outFile.txt' with columns: TF, target, importance")
+
+#save rankedEdges.csv with exact header: Gene1^IGene2^IEdgeWeight$
+header = "Gene1\tGene2\tEdgeWeight\n"
+with open("rankedEdges.csv", "w") as f:
+    f.write(header)
+df_edges.to_csv("rankedEdges.csv", sep="\t", index=False, header=False, mode='a')
+print("Saved rankedEdges.csv with exact header: Gene1^IGene2^IEdgeWeight$ (tabs)")
+
+#save total runtime to time.txt
+with open("time.txt", "w") as f:
+    f.write(f"Real time (seconds): {end - start:.2f}\n")
+print("Saved runtime to 'time.txt'")
+
+df_out.to_csv("outFile.txt", sep="\t", index=False)
+output_file = "outFile.txt"
+print(f"Saved Beeline-compatible output to '{output_file}'")
+
+print(f"Saved Beeline-compatible output to '{output_file}'")
+#to note how long the job takes
